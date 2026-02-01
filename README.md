@@ -1,53 +1,47 @@
-# Missing Header Checker (Burp Suite Extension)
+Missing Header Checker (Burp Suite Extension)
+A professional Burp Suite extension, written in Python (Jython), designed to efficiently scan multiple targets for missing HTTP security headers without freezing the UI.
 
-A Burp Suite extension, written in Python (Jython), to scan websites for missing HTTP security headers.
+<img width="984" height="429" alt="Screenshot 2569-02-02 at 02 07 31" src="https://github.com/user-attachments/assets/6d70eb63-a61a-496c-b2ad-4afb728fd528" />
+
+🌟 Key Features
+Smart Input Support: Supports full URLs (https://example.com) or just naked domains (example.com). The extension automatically guesses the protocol and follows redirects to the final destination.
 
 
-<img width="1268" height="673" alt="Screenshot 2568-11-11 at 18 04 30" src="https://github.com/user-attachments/assets/738f572f-a24c-4492-867e-c91fa2e01b99" />
+Asynchronous Scanning: Runs scans in the background using a thread pool, ensuring Burp Suite's UI remains responsive during large-scale tests.
 
+Enhanced 5-Button UI:
 
----
+- Run Scan: Executes the scan in a background thread.
+- Stop: Allows immediate cancellation of an ongoing scan.
+- Report: Displays a high-level summary table and a detailed finding example for reporting.
+- Show Details: Provides a granular breakdown (Status + Value) for every header across all targets.
+- Save: Export findings into two professional formats: Summary Report (CSV) for quick stats or Full Result (HTML) for detailed records.
 
-## 🌟 Features
+Comprehensive Header Coverage:
 
-* **Follows Redirects:** Automatically follows 30x redirects to scan the final destination page.
-* **Multi-URL Input:** Scan multiple URLs at once (comma-separated or on new lines).
-* **3-Button UI:**
-    * **Run Scan:** Performs the scan in the background.
-    * **Report:** Shows a high-level summary table (color-coded) and an example of the first finding.
-    * **Show Details:** Provides a detailed breakdown (Present/Missing + Value) for every header, for every URL scanned.
-* **Headers Checked:**
-    * X-Content-Type-Options
-    * Referrer-Policy
-    * Permissions-Policy
-    * Strict-Transport-Security (HSTS)
-    * Content-Security-Policy (CSP)
-    * X-Frame-Options (XFO)
+- X-Content-Type-Options 
+- Referrer-Policy 
+- Permissions-Policy 
+- Strict-Transport-Security (HSTS) 
+- Content-Security-Policy (CSP) 
+- X-Frame-Options (XFO) (With logic to detect if covered by CSP frame-ancestors) 
 
----
+🛠️ Installation
+Requirements:
+- Burp Suite (Pro or Community)
+- Jython Standalone JAR (v2.7.x)
 
-## 🛠️ Installation
+Steps:
+Open Burp Suite.
+1. Go to Extensions > Extension Settings > Python Environment.
+2. Select your jython-standalone.jar file.
+3. Go to Extensions > Installed > Add.
+4. Set Extension type to Python and select MissingHeadersCheck.py.
+5. The "Missing Headers" tab will appear once loaded.
 
-1.  **Requirements:**
-    * Burp Suite (Pro or Community)
-    * [Jython Standalone JAR](https://www.jython.org/download) (v2.7.x)
-
-2.  **Steps:**
-    * Open Burp Suite.
-    * Go to the **Extender** tab > **Options** tab.
-    * Under "Python Environment", click **"Select file"** and choose your `jython-standalone.jar` file.
-    * Go to the **Extender** tab > **Extensions** tab.
-    * Click **"Add"**.
-    * Under "Extension Details", set **Extension type** to **Python**.
-    * Click **"Select file"** and choose the `MissingHeadersCheck.py` file.
-    * Click **"Next"**. The extension should load, and a new "Missing Headers" tab will appear.
-
----
-
-## 🖱️ Usage
-
-1.  Go to the **"Missing Headers"** tab.
-2.  Paste one or more target URLs into the text box (e.g., `https://google.com`).
-3.  Click **"Run Scan"**.
-4.  Wait for the scan to complete (a message will appear).
-5.  Click **"Report"** for the summary table or **"Show Details"** for the full breakdown.
+🖱️ Usage
+1. Navigate to the "Missing Headers" tab.
+2. Input your targets (URLs or Domains) separated by commas or new lines.
+3. Click "Run Scan".
+4. Use "Report" or "Show Details" to view findings within Burp.
+5. Click "Save..." to export your results as a CSV report or a full HTML analysis.
