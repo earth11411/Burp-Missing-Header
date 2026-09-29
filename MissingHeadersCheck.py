@@ -10,6 +10,7 @@ from java.util.concurrent import Executors, TimeUnit
 import threading
 import urlparse # Use urlparse for Python 2.7 (Jython)
 import cgi # Import cgi for escaping HTML
+import re
 
 # We use threading to run the scan in the background
 # without freezing Burp's UI.
@@ -21,8 +22,139 @@ HEADERS_TO_CHECK = [
     "Permissions-Policy",
     "Strict-Transport-Security",
     "Content-Security-Policy",
-    "X-Frame-Options"
+    "X-Frame-Options",
+    "X-XSS-Protection",
+    "Access-Control-Allow-Methods",
+    "Cache-Control"
 ]
+
+# HTTP methods that should never be permitted via CORS / at all on a production endpoint
+HIGH_RISK_CORS_METHODS = ["TRACE", "CONNECT"]
+# HTTP methods that are not inherently dangerous but warrant a caution note if exposed cross-origin
+CAUTION_CORS_METHODS = ["PUT", "DELETE"]
+
+# --- Header attribute/value validators -----------------------------------
+# Each function receives the raw header value (or None if the header was
+# absent) and returns a (status, note) tuple. "status" is one of:
+#   Missing / Present / Weak / N/A
+# "note" is a short, human readable explanation used in the detailed report.
+
+def _check_hsts_value(value):
+    """Validate Strict-Transport-Security max-age / includeSubDomains."""
+    if value is None:
+        return ("Missing", "Header not present")
+    v = value.lower()
+    issues = []
+    match = re.search(r'max-age\s*=\s*(\d+)', v)
+    if not match:
+        issues.append("no 'max-age' directive found")
+    else:
+        max_age = int(match.group(1))
+        if max_age <= 0:
+            issues.append("'max-age' is 0 (HSTS effectively disabled)")
+        elif max_age < 31536000:
+            issues.append("'max-age' is only {}s (recommended >= 31536000, i.e. 1 year)".format(max_age))
+    if "includesubdomains" not in v:
+        issues.append("missing 'includeSubDomains'")
+    if issues:
+        return ("Weak", "; ".join(issues))
+    return ("Present", "max-age and includeSubDomains correctly configured")
+
+def _check_csp_value(value):
+    """Validate Content-Security-Policy for common weakening directives."""
+    if value is None:
+        return ("Missing", "Header not present")
+    v = value.lower()
+    issues = []
+    if "unsafe-inline" in v:
+        issues.append("allows 'unsafe-inline'")
+    if "unsafe-eval" in v:
+        issues.append("allows 'unsafe-eval'")
+    if re.search(r"(default-src|script-src|style-src)\s*[^;]*\*(?!\.)", v):
+        issues.append("uses a wildcard ('*') source")
+    if "default-src" not in v and "script-src" not in v:
+        issues.append("missing both 'default-src' and 'script-src' directives")
+    if issues:
+        return ("Weak", "; ".join(issues))
+    return ("Present", "No wildcard / unsafe-inline / unsafe-eval directives found")
+
+def _check_xfo_value(value):
+    """Validate X-Frame-Options is one of the three recognised values."""
+    if value is None:
+        return ("Missing", "Header not present")
+    v = value.strip().lower()
+    if v == "deny" or v == "sameorigin" or v.startswith("allow-from"):
+        return ("Present", "")
+    return ("Weak", "Unrecognized value '{}' (expected DENY, SAMEORIGIN or ALLOW-FROM uri)".format(value))
+
+def _check_xcto_value(value):
+    """Validate X-Content-Type-Options is exactly 'nosniff'."""
+    if value is None:
+        return ("Missing", "Header not present")
+    if value.strip().lower() != "nosniff":
+        return ("Weak", "Value should be exactly 'nosniff', found '{}'".format(value))
+    return ("Present", "")
+
+def _check_xxss_value(value):
+    """
+    X-XSS-Protection is deprecated. Best practice is to remove/disable it and
+    rely on Content-Security-Policy instead, so its absence is NOT a finding.
+    """
+    if value is None:
+        return ("N/A", "Not present (fine - deprecated header, rely on CSP for XSS mitigation)")
+    v = value.strip()
+    if v == "0":
+        return ("Present", "Explicitly disabled, as recommended")
+    return ("Weak", "Deprecated header is enabled ('{}'). Remove it or set it to '0' and rely on CSP instead".format(value))
+
+def _check_cors_methods_value(value):
+    """
+    Validate Access-Control-Allow-Methods. Only meaningful when the server
+    actually returns it (typically on CORS/OPTIONS preflight responses).
+    """
+    if value is None:
+        return ("N/A", "Header not observed on this response (only applies to CORS preflight responses)")
+    methods = [m.strip().upper() for m in value.split(",") if m.strip()]
+    high_risk = [m for m in methods if m in HIGH_RISK_CORS_METHODS]
+    caution = [m for m in methods if m in CAUTION_CORS_METHODS]
+    if high_risk:
+        return ("Weak", "Dangerous method(s) allowed: {}. TRACE/CONNECT should be explicitly disabled".format(", ".join(high_risk)))
+    if caution:
+        return ("Present", "Allowed: {}. Note: {} should only be permitted if actually required".format(", ".join(methods), ", ".join(caution)))
+    return ("Present", "Allowed: {}".format(", ".join(methods)) if methods else "")
+
+def _check_cache_control_value(present_headers_map):
+    """
+    Validate Cache-Control against the two recommended patterns:
+      1) Permissive (store + revalidate): no-cache, must-revalidate + ETag
+      2) Strict (no caching at all): no-store, no-cache, must-revalidate,
+         max-age=0 + Pragma: no-cache + Expires: 0
+    """
+    cache_control = present_headers_map.get("cache-control")
+    if cache_control is None:
+        return ("Missing", "No Cache-Control header found; responses may be cached indefinitely by the browser")
+    v = cache_control.lower()
+    has_no_store = "no-store" in v
+    has_no_cache = "no-cache" in v
+    has_must_revalidate = "must-revalidate" in v
+    pragma = present_headers_map.get("pragma", "")
+    expires = present_headers_map.get("expires", "")
+    etag = present_headers_map.get("etag")
+
+    if has_no_store and has_no_cache and has_must_revalidate:
+        notes = ["Strict no-cache policy (no-store, no-cache, must-revalidate)"]
+        if "no-cache" not in pragma.lower():
+            notes.append("missing 'Pragma: no-cache'")
+        if expires.strip() != "0":
+            notes.append("missing 'Expires: 0'")
+        return ("Present", "; ".join(notes))
+    if has_no_cache and has_must_revalidate and not has_no_store:
+        notes = ["Permissive caching with mandatory revalidation (no-cache, must-revalidate)"]
+        if not etag:
+            notes.append("missing ETag for revalidation")
+        return ("Present", "; ".join(notes))
+    return ("Weak", "Does not enforce no-cache/no-store + must-revalidate; response may be cached and reused without revalidation")
+# ---------------------------------------------------------------------------
 
 class BurpExtender(IBurpExtender, ITab):
 
@@ -283,59 +415,76 @@ class BurpExtender(IBurpExtender, ITab):
 
             # 1. X-Content-Type-Options
             header_name_lower = "x-content-type-options"
-            if header_name_lower not in present_headers_map:
-                missing.append("X-Content-Type-Options")
-                header_details["X-Content-Type-Options"] = ("Missing", "")
-            else:
-                header_details["X-Content-Type-Options"] = ("Present", present_headers_map[header_name_lower])
+            raw_value = present_headers_map.get(header_name_lower)
+            status, note = _check_xcto_value(raw_value)
+            header_details["X-Content-Type-Options"] = (status, raw_value or "", note)
+            if status in ("Missing", "Weak"):
+                missing.append("X-Content-Type-Options" + (" (Weak)" if status == "Weak" else ""))
 
             # 2. Referrer-Policy
             header_name_lower = "referrer-policy"
             if header_name_lower not in present_headers_map:
                 missing.append("Referrer-Policy")
-                header_details["Referrer-Policy"] = ("Missing", "")
+                header_details["Referrer-Policy"] = ("Missing", "", "")
             else:
-                header_details["Referrer-Policy"] = ("Present", present_headers_map[header_name_lower])
+                header_details["Referrer-Policy"] = ("Present", present_headers_map[header_name_lower], "")
                 
             # 3. Permissions-Policy
             header_name_lower = "permissions-policy"
             if header_name_lower not in present_headers_map:
                 missing.append("Permissions-Policy")
-                header_details["Permissions-Policy"] = ("Missing", "")
+                header_details["Permissions-Policy"] = ("Missing", "", "")
             else:
-                header_details["Permissions-Policy"] = ("Present", present_headers_map[header_name_lower])
+                header_details["Permissions-Policy"] = ("Present", present_headers_map[header_name_lower], "")
 
             # 4. Strict-Transport-Security
             header_name_lower = "strict-transport-security"
             if final_url_scheme == "https":
-                if header_name_lower not in present_headers_map:
-                    missing.append("Strict-Transport-Security")
-                    header_details["Strict-Transport-Security"] = ("Missing", "")
-                else:
-                    header_details["Strict-Transport-Security"] = ("Present", present_headers_map[header_name_lower])
+                raw_value = present_headers_map.get(header_name_lower)
+                status, note = _check_hsts_value(raw_value)
+                header_details["Strict-Transport-Security"] = (status, raw_value or "", note)
+                if status in ("Missing", "Weak"):
+                    missing.append("Strict-Transport-Security" + (" (Weak)" if status == "Weak" else ""))
             else:
-                header_details["Strict-Transport-Security"] = ("N/A (HTTP)", "")
+                header_details["Strict-Transport-Security"] = ("N/A (HTTP)", "", "HSTS only applies to HTTPS responses")
 
             # 5. CSP / XFO Logic
-            has_csp = "content-security-policy" in present_headers_map
-            has_xfo = "x-frame-options" in present_headers_map
-            csp_value = present_headers_map.get("content-security-policy", "")
-            has_frame_ancestors = "frame-ancestors" in csp_value.lower()
-            
-            if not has_csp:
-                missing.append("Content-Security-Policy")
-                header_details["Content-Security-Policy"] = ("Missing", "")
+            csp_raw = present_headers_map.get("content-security-policy")
+            csp_status, csp_note = _check_csp_value(csp_raw)
+            header_details["Content-Security-Policy"] = (csp_status, csp_raw or "", csp_note)
+            if csp_status in ("Missing", "Weak"):
+                missing.append("Content-Security-Policy" + (" (Weak)" if csp_status == "Weak" else ""))
+
+            has_frame_ancestors = bool(csp_raw) and "frame-ancestors" in csp_raw.lower()
+            xfo_raw = present_headers_map.get("x-frame-options")
+            if xfo_raw is None and has_frame_ancestors:
+                header_details["X-Frame-Options"] = ("N/A (Covered by CSP)", "", "'frame-ancestors' directive present in CSP")
             else:
-                header_details["Content-Security-Policy"] = ("Present", csp_value)
-            
-            if not has_xfo and not has_frame_ancestors:
-                missing.append("X-Frame-Options")
-                header_details["X-Frame-Options"] = ("Missing", "")
-            elif has_xfo:
-                header_details["X-Frame-Options"] = ("Present", present_headers_map.get("x-frame-options"))
-            else:
-                 header_details["X-Frame-Options"] = ("N/A (Covered by CSP)", "")
-            
+                xfo_status, xfo_note = _check_xfo_value(xfo_raw)
+                header_details["X-Frame-Options"] = (xfo_status, xfo_raw or "", xfo_note)
+                if xfo_status in ("Missing", "Weak"):
+                    missing.append("X-Frame-Options" + (" (Weak)" if xfo_status == "Weak" else ""))
+
+            # 6. X-XSS-Protection (deprecated - absence is fine, presence must be '0')
+            xxss_raw = present_headers_map.get("x-xss-protection")
+            xxss_status, xxss_note = _check_xxss_value(xxss_raw)
+            header_details["X-XSS-Protection"] = (xxss_status, xxss_raw or "", xxss_note)
+            if xxss_status == "Weak":
+                missing.append("X-XSS-Protection (Weak)")
+
+            # 7. Access-Control-Allow-Methods (only meaningful if server returned it)
+            acam_raw = present_headers_map.get("access-control-allow-methods")
+            acam_status, acam_note = _check_cors_methods_value(acam_raw)
+            header_details["Access-Control-Allow-Methods"] = (acam_status, acam_raw or "", acam_note)
+            if acam_status == "Weak":
+                missing.append("Access-Control-Allow-Methods (Weak)")
+
+            # 8. Cache-Control (+ Pragma / Expires / ETag as supporting evidence)
+            cache_status, cache_note = _check_cache_control_value(present_headers_map)
+            header_details["Cache-Control"] = (cache_status, present_headers_map.get("cache-control", ""), cache_note)
+            if cache_status in ("Missing", "Weak"):
+                missing.append("Cache-Control" + (" (Weak)" if cache_status == "Weak" else ""))
+
             missing_list_str = ", ".join(sorted(missing))
             if not missing_list_str:
                 missing_list_str = "All required headers are present."
@@ -532,16 +681,19 @@ class BurpExtender(IBurpExtender, ITab):
             report_html.append("<th>Header Name</th>")
             report_html.append("<th>Status</th>")
             report_html.append("<th>Value</th>")
+            report_html.append("<th>Note</th>")
             report_html.append("</tr>")
 
             # Loop through the headers in our defined order
             for header_name_in_order in HEADERS_TO_CHECK:
                 if header_name_in_order in header_details:
-                    status, value = header_details[header_name_in_order]
+                    status, value, note = header_details[header_name_in_order]
                     
                     color = "black"
                     if status == "Missing":
                         color = "red"
+                    elif status == "Weak":
+                        color = "orange"
                     elif status == "Present":
                         color = "green"
                     elif "N/A" in status:
@@ -551,6 +703,7 @@ class BurpExtender(IBurpExtender, ITab):
                     report_html.append("<td>{}</td>".format(cgi.escape(header_name_in_order)))
                     report_html.append("<td style='color: {};'><b>{}</b></td>".format(color, cgi.escape(status)))
                     report_html.append("<td>{}</td>".format(cgi.escape(value)))
+                    report_html.append("<td>{}</td>".format(cgi.escape(note) if note else ""))
                     report_html.append("</tr>")
             
             report_html.append("</table>")
