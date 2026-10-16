@@ -1,11 +1,14 @@
 # -*- coding: utf-8 -*-
 from burp import IBurpExtender, ITab
 from javax.swing import (JPanel, JTextArea, JButton, JScrollPane,
-                         Box, JLabel, JSplitPane, JEditorPane, JFileChooser, JOptionPane)
+                         Box, JLabel, JSplitPane, JEditorPane, JFileChooser, JOptionPane,
+                         JTable, JComboBox, JTextField)
 from javax.swing import SwingUtilities
-from java.awt import Font, BorderLayout
+from javax.swing.table import DefaultTableModel
+from java.awt import Font, BorderLayout, Dimension
 from java.io import File, BufferedWriter, FileWriter
 from java.net import URL
+from java.util import ArrayList
 from java.util.concurrent import Executors, TimeUnit
 import threading
 import urlparse # Use urlparse for Python 2.7 (Jython)
@@ -177,7 +180,50 @@ class BurpExtender(IBurpExtender, ITab):
         self._url_input = JTextArea(10, 80)
         self._url_input.setText("https://google.com, https://example.com\nhttps://owasp.org")
         input_box.add(JScrollPane(self._url_input))
-        
+
+        # --- NEW: Cookie Panel ---
+        input_box.add(Box.createVerticalStrut(8))
+        input_box.add(JLabel("Cookies (optional) - Target: host (example.com), wildcard (*.example.com), "
+                             "URL prefix (https://example.com/app) or * = all hosts"))
+
+        cookie_row = Box.createHorizontalBox()
+        cookie_row.add(JLabel("Target: "))
+        self._cookie_target = JComboBox()
+        self._cookie_target.setEditable(True)
+        self._cookie_target.setPreferredSize(Dimension(260, 26))
+        self._cookie_target.setMaximumSize(Dimension(320, 26))
+        cookie_row.add(self._cookie_target)
+        cookie_row.add(Box.createHorizontalStrut(5))
+        cookie_row.add(JButton("Load Hosts", actionPerformed=self.load_hosts_into_combo))
+        cookie_row.add(Box.createHorizontalStrut(10))
+        cookie_row.add(JLabel("Cookie: "))
+        self._cookie_value = JTextField(40)
+        self._cookie_value.setMaximumSize(Dimension(2000, 26))
+        self._cookie_value.setToolTipText("e.g. SESSIONID=abc123; token=xyz  (a leading 'Cookie:' is stripped automatically)")
+        cookie_row.add(self._cookie_value)
+        cookie_row.add(Box.createHorizontalStrut(5))
+        cookie_row.add(JButton("Add", actionPerformed=self.add_cookie_rule))
+        cookie_row.add(Box.createHorizontalStrut(5))
+        cookie_row.add(JButton("Add to All Hosts", actionPerformed=self.add_cookie_all_hosts))
+        input_box.add(cookie_row)
+
+        self._cookie_model = DefaultTableModel(["Target", "Cookie"], 0)
+        self._cookie_table = JTable(self._cookie_model)  # cells are editable by double-click
+        self._cookie_table.getColumnModel().getColumn(0).setPreferredWidth(250)
+        self._cookie_table.getColumnModel().getColumn(1).setPreferredWidth(600)
+        cookie_scroll = JScrollPane(self._cookie_table)
+        cookie_scroll.setPreferredSize(Dimension(800, 90))
+        input_box.add(cookie_scroll)
+
+        cookie_btn_row = Box.createHorizontalBox()
+        cookie_btn_row.add(JButton("Remove Selected", actionPerformed=self.remove_cookie_rule))
+        cookie_btn_row.add(Box.createHorizontalStrut(10))
+        cookie_btn_row.add(JButton("Clear All Cookies", actionPerformed=self.clear_cookie_rules))
+        input_box.add(cookie_btn_row)
+        input_box.add(Box.createVerticalStrut(8))
+        self._cookie_rules = []
+        # --- End Cookie Panel ---
+
         # --- NEW: Button Panel with 3 Buttons ---
         button_panel = Box.createHorizontalBox()
         self._run_button = JButton("Run Scan", actionPerformed=self.start_scan)
@@ -258,6 +304,150 @@ class BurpExtender(IBurpExtender, ITab):
             
         return result_holder["response"], None
 
+    # --- Cookie management -------------------------------------------------
+    def _extract_hosts_from_input(self):
+        """Return unique hostnames from the URL input box (keeps input order)."""
+        hosts = []
+        for line in self._url_input.getText().splitlines():
+            for u in line.split(","):
+                u = u.strip()
+                if not u:
+                    continue
+                if not re.match(r"^https?://", u, re.I):
+                    u = "https://" + u
+                try:
+                    h = urlparse.urlparse(u).hostname
+                except Exception:
+                    h = None
+                if h and h not in hosts:
+                    hosts.append(h)
+        return hosts
+
+    def load_hosts_into_combo(self, event):
+        """Fill the Target drop-down with the hosts from the URL list."""
+        current = self._cookie_target.getEditor().getItem()
+        self._cookie_target.removeAllItems()
+        for h in self._extract_hosts_from_input():
+            self._cookie_target.addItem(h)
+        if current:
+            self._cookie_target.setSelectedItem(current)
+
+    def _normalize_cookie(self, raw):
+        """Strip a leading 'Cookie:', CR/LF (header injection) and trailing ';'."""
+        if raw is None:
+            return ""
+        v = unicode(raw).replace("\r", "").replace("\n", "").strip()
+        if v.lower().startswith("cookie:"):
+            v = v[7:].strip()
+        return v.rstrip(";").strip()
+
+    def add_cookie_rule(self, event):
+        item = self._cookie_target.getEditor().getItem()
+        target = unicode(item).strip() if item else ""
+        cookie = self._normalize_cookie(self._cookie_value.getText())
+        if not target:
+            JOptionPane.showMessageDialog(self._panel, "Please enter or select a Target (host / URL), or use 'Add to All Hosts'.")
+            return
+        if not cookie:
+            JOptionPane.showMessageDialog(self._panel, "Please enter a cookie value, e.g. SESSIONID=abc123")
+            return
+        self._cookie_model.addRow([target, cookie])
+        self._cookie_value.setText("")
+
+    def add_cookie_all_hosts(self, event):
+        cookie = self._normalize_cookie(self._cookie_value.getText())
+        if not cookie:
+            JOptionPane.showMessageDialog(self._panel, "Please enter a cookie value, e.g. SESSIONID=abc123")
+            return
+        self._cookie_model.addRow(["*", cookie])
+        self._cookie_value.setText("")
+
+    def remove_cookie_rule(self, event):
+        if self._cookie_table.isEditing():
+            self._cookie_table.getCellEditor().stopCellEditing()
+        for r in sorted(list(self._cookie_table.getSelectedRows()), reverse=True):
+            self._cookie_model.removeRow(r)
+
+    def clear_cookie_rules(self, event):
+        if self._cookie_table.isEditing():
+            self._cookie_table.getCellEditor().stopCellEditing()
+        self._cookie_model.setRowCount(0)
+
+    def _snapshot_cookie_rules(self):
+        """Copy table rows into a plain list (called on the Swing thread before scanning)."""
+        if self._cookie_table.isEditing():
+            self._cookie_table.getCellEditor().stopCellEditing()
+        rules = []
+        for i in range(self._cookie_model.getRowCount()):
+            t = self._cookie_model.getValueAt(i, 0)
+            c = self._cookie_model.getValueAt(i, 1)
+            t = unicode(t).strip() if t else ""
+            c = self._normalize_cookie(c)
+            if t and c:
+                rules.append((t, c))
+        return rules
+
+    @staticmethod
+    def _default_port(scheme):
+        return 443 if scheme == "https" else 80
+
+    def _rule_matches(self, target, url_str):
+        """Check whether a cookie rule target applies to the URL being requested."""
+        t = target.strip().lower()
+        if t == "*":
+            return True
+        up = urlparse.urlparse(url_str)
+        u_host = (up.hostname or "").lower()
+        u_port = up.port or self._default_port(up.scheme)
+
+        # URL prefix rule: scheme + host + port must match, path is a prefix
+        if t.startswith("http://") or t.startswith("https://"):
+            tp = urlparse.urlparse(t)
+            if tp.scheme != up.scheme.lower() or (tp.hostname or "") != u_host:
+                return False
+            if (tp.port or self._default_port(tp.scheme)) != u_port:
+                return False
+            t_path = tp.path or "/"
+            u_path = (up.path or "/").lower()
+            if t_path == "/" or u_path == t_path:
+                return True
+            return u_path.startswith(t_path.rstrip("/") + "/") or u_path.startswith(t_path)
+
+        # Host rule (optionally host:port)
+        t_port = None
+        m = re.match(r"^(.*):(\d+)$", t)
+        if m:
+            t, t_port = m.group(1), int(m.group(2))
+        if t_port is not None and t_port != u_port:
+            return False
+        if t.startswith("*."):
+            base = t[2:]
+            return u_host == base or u_host.endswith("." + base)
+        return u_host == t
+
+    def _cookies_for(self, url_str):
+        """Combine all matching cookie rules into one Cookie header value."""
+        values = []
+        for target, cookie in self._cookie_rules:
+            try:
+                if self._rule_matches(target, url_str) and cookie not in values:
+                    values.append(cookie)
+            except Exception as e:
+                print("Cookie rule error ({}): {}".format(target, e))
+        return "; ".join(values)
+
+    def _add_cookie_header(self, request_bytes, cookie_value):
+        """Return a copy of the request with the Cookie header set/replaced."""
+        req_info = self._helpers.analyzeRequest(request_bytes)
+        new_headers = ArrayList()
+        for h in req_info.getHeaders():
+            if not h.lower().startswith("cookie:"):
+                new_headers.add(h)
+        new_headers.add("Cookie: " + cookie_value)
+        body = request_bytes[req_info.getBodyOffset():]
+        return self._helpers.buildHttpMessage(new_headers, body)
+    # -------------------------------------------------------------------------
+
     # --- Button Action 1: Start Scan ---
     def start_scan(self, event):
         """Wrapper to run the scan in a new thread."""
@@ -277,7 +467,10 @@ class BurpExtender(IBurpExtender, ITab):
         self._last_scan_results = []
         self._first_example_data = None
         self._scan_lock = threading.Lock()
-        
+
+        # Take a snapshot of cookie rules (read on the Swing thread)
+        self._cookie_rules = self._snapshot_cookie_rules()
+
         # Run the full scan
         thread = threading.Thread(target=self.scan_urls) 
         thread.start()
@@ -329,8 +522,9 @@ class BurpExtender(IBurpExtender, ITab):
 
         response_to_analyze = None
         final_url_for_analysis = original_url_str
-        header_details = {} 
+        header_details = {}
         scan_error_msg = None
+        last_cookie_applied = False
 
         for attempt_url in targets_to_attempt:
             if not self._is_scanning: 
@@ -350,8 +544,17 @@ class BurpExtender(IBurpExtender, ITab):
                     if not path.startswith("/"):
                         path = "/" + path
                         
+                    if parsed_url.query:
+                        path = path + "?" + parsed_url.query
+
                     url_obj = URL(parsed_url.scheme, host, port, path)
                     request_bytes = self._helpers.buildHttpRequest(url_obj)
+
+                    # --- NEW: attach matching cookies ---
+                    cookie_header = self._cookies_for(current_url_str)
+                    if cookie_header:
+                        request_bytes = self._add_cookie_header(request_bytes, cookie_header)
+                    last_cookie_applied = bool(cookie_header)
 
                     http_service = self._helpers.buildHttpService(host, port, is_https)
                     
@@ -411,7 +614,8 @@ class BurpExtender(IBurpExtender, ITab):
                     present_headers_map[parts[0].strip().lower()] = parts[1].strip()
 
             missing = []
-            final_url_scheme = urlparse.urlparse(final_url_for_analysis).scheme
+            header_details["_cookie_applied"] = last_cookie_applied
+            final_url_scheme =urlparse.urlparse(final_url_for_analysis).scheme
 
             # 1. X-Content-Type-Options
             header_name_lower = "x-content-type-options"
@@ -675,6 +879,9 @@ class BurpExtender(IBurpExtender, ITab):
                     report_html.append("<p><i>No header data to display (scan may have failed).</i></p>")
                 report_html.append("<br>")
                 continue
+
+            if header_details.get("_cookie_applied"):
+                report_html.append("<p style='color:#336699;'><i>Authenticated request: cookie was sent with this request.</i></p>")
 
             report_html.append("<table border='1' cellpadding='5' cellspacing='0' style='border-collapse: collapse; font-size: 12px;'>")
             report_html.append("<tr style='background-color: #f0f0f0;'>")
